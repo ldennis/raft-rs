@@ -29,7 +29,7 @@ fn main() {
     // Create a storage for Raft, and here we just use a simple memory storage.
     // You need to build your own persistent storage in your production.
     // Please check the Storage trait in src/storage.rs to see how to implement one.
-    let storage = MemStorage::new_with_conf_state(ConfState::from((vec![1], vec![])));
+    let storage = MemStorage::new_with_conf_state(ConfState::from((vec![820], vec![])));
 
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
@@ -43,7 +43,7 @@ fn main() {
     // Create the configuration for the Raft node.
     let cfg = Config {
         // The unique ID for the Raft node.
-        id: 1,
+        id: 820,
         // Election tick is for how long the follower may campaign again after
         // it doesn't receive any message from the leader.
         election_tick: 10,
@@ -79,10 +79,14 @@ fn main() {
     loop {
         match receiver.recv_timeout(timeout) {
             Ok(Msg::Propose { id, cb }) => {
+                info!(logger, "DLZ got Msg::Propose");
                 cbs.insert(id, cb);
                 r.propose(vec![], vec![id]).unwrap();
             }
-            Ok(Msg::Raft(m)) => r.step(m).unwrap(),
+            Ok(Msg::Raft(m)) => {
+                info!(logger, "DLZ got Msg::Raft");
+                r.step(m).unwrap();
+            }
             Err(RecvTimeoutError::Timeout) => (),
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -92,15 +96,20 @@ fn main() {
         if d >= timeout {
             timeout = Duration::from_millis(100);
             // We drive Raft every 100ms.
+            info!(logger, "DLZ ticking Raft");
             r.tick();
         } else {
             timeout -= d;
         }
-        on_ready(&mut r, &mut cbs);
+        on_ready(logger.clone(), &mut r, &mut cbs);
     }
 }
 
-fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeCallback>) {
+fn on_ready(
+    logger: Logger,
+    raft_group: &mut RawNode<MemStorage>,
+    cbs: &mut HashMap<u8, ProposeCallback>,
+) {
     if !raft_group.has_ready() {
         return;
     }
@@ -108,6 +117,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
 
     // Get the `Ready` with `RawNode::ready` interface.
     let mut ready = raft_group.ready();
+    info!(logger, "DLZ received Ready {ready:?}");
 
     let handle_messages = |msgs: Vec<Message>| {
         for _msg in msgs {
@@ -127,6 +137,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
 
     let mut _last_apply_index = 0;
     let mut handle_committed_entries = |committed_entries: Vec<Entry>| {
+        info!(logger, "DLZ handle_committed_entries {committed_entries:?}");
         for entry in committed_entries {
             // Mostly, you need to save the last apply index to resume applying
             // after restart. Here we just ignore this because we use a Memory storage.
@@ -139,6 +150,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
 
             if entry.get_entry_type() == EntryType::EntryNormal {
                 if let Some(cb) = cbs.remove(entry.data.first().unwrap()) {
+                    info!(logger, "DLZ calling cb()");
                     cb();
                 }
             }
@@ -165,6 +177,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
 
     // Advance the Raft.
     let mut light_rd = raft_group.advance(ready);
+    info!(logger, "DLZ received LightReady {light_rd:?}");
     // Update commit index.
     if let Some(commit) = light_rd.commit_index() {
         store.wl().mut_hard_state().set_commit(commit);
@@ -180,7 +193,7 @@ fn on_ready(raft_group: &mut RawNode<MemStorage>, cbs: &mut HashMap<u8, ProposeC
 fn send_propose(logger: Logger, sender: mpsc::Sender<Msg>) {
     thread::spawn(move || {
         // Wait some time and send the request to the Raft.
-        thread::sleep(Duration::from_secs(10));
+        thread::sleep(Duration::from_secs(5));
 
         let (s1, r1) = mpsc::channel::<u8>();
 

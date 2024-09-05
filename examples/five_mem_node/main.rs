@@ -13,7 +13,7 @@ use std::{str, thread};
 
 use protobuf::Message as PbMessage;
 use raft::storage::MemStorage;
-use raft::{prelude::*, StateRole};
+use raft::{prelude::*, GetEntriesContext, StateRole};
 use regex::Regex;
 
 use slog::{error, info, o};
@@ -53,12 +53,14 @@ fn main() {
             // Peer 1 is the leader.
             0 => Node::create_raft_leader(1, rx, mailboxes, &logger),
             // Other peers are followers.
-            _ => Node::create_raft_follower(rx, mailboxes),
+            _ => Node::create_raft_follower(u64::try_from(i+1).unwrap(), rx, mailboxes),
         };
         let proposals = Arc::clone(&proposals);
 
         // Tick the raft node per 100ms. So use an `Instant` to trace it.
         let mut t = Instant::now();
+
+        let mut low_log_index: u64 = 0;
 
         // Clone the stop receiver
         let rx_stop_clone = Arc::clone(&rx_stop);
@@ -69,7 +71,10 @@ fn main() {
             loop {
                 // Step raft messages.
                 match node.my_mailbox.try_recv() {
-                    Ok(msg) => node.step(msg, &logger),
+                    Ok(msg) => {
+                        info!(logger, "DLZ stepping Node{} with Message: {msg:?}", node.id);
+                        node.step(msg, &logger);
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
                 }
@@ -83,6 +88,7 @@ fn main() {
 
             if t.elapsed() >= Duration::from_millis(100) {
                 // Tick the raft.
+                // info!(logger, "DLZ ticking Node{}", node.id);
                 raft_group.tick();
                 t = Instant::now();
             }
@@ -98,12 +104,25 @@ fn main() {
 
             // Handle readies from the raft.
             on_ready(
+                node.id,
                 raft_group,
                 &mut node.kv_pairs,
                 &node.mailboxes,
                 &proposals,
                 &logger,
             );
+
+            if raft_group.raft.state == StateRole::Leader {
+                if low_log_index == 0 {
+                    low_log_index = raft_group.store().first_index().unwrap();
+                }
+                let high_log_index = raft_group.raft.r.raft_log.committed + 1;
+                if low_log_index != high_log_index && low_log_index < high_log_index {
+                    let entries = raft_group.store().entries(low_log_index, high_log_index, u64::MAX, GetEntriesContext::empty(false)).unwrap();
+                    info!(logger, "DLZ Node1 has committed entries: {entries:?}");
+                }
+                low_log_index = high_log_index;
+            }
 
             // Check control signals from the main thread.
             if check_signals(&rx_stop_clone) {
@@ -116,11 +135,14 @@ fn main() {
     // Propose some conf changes so that followers can be initialized.
     add_all_followers(proposals.as_ref());
 
+    thread::sleep(Duration::from_secs(5));
+
     // Put 100 key-value pairs.
     info!(
         logger,
         "We get a 5 nodes Raft cluster now, now propose 100 proposals"
     );
+
     (0..100u16)
         .filter(|i| {
             let (proposal, rx) = Proposal::normal(*i, "hello, world".to_owned());
@@ -158,6 +180,7 @@ fn check_signals(receiver: &Arc<Mutex<mpsc::Receiver<Signal>>>) -> bool {
 
 struct Node {
     // None if the raft is not initialized.
+    id: u64,
     raft_group: Option<RawNode<MemStorage>>,
     my_mailbox: Receiver<Message>,
     mailboxes: HashMap<u64, Sender<Message>>,
@@ -188,6 +211,7 @@ impl Node {
         storage.wl().apply_snapshot(s).unwrap();
         let raft_group = Some(RawNode::new(&cfg, storage, &logger).unwrap());
         Node {
+            id,
             raft_group,
             my_mailbox,
             mailboxes,
@@ -197,10 +221,12 @@ impl Node {
 
     // Create a raft follower.
     fn create_raft_follower(
+        id: u64,
         my_mailbox: Receiver<Message>,
         mailboxes: HashMap<u64, Sender<Message>>,
     ) -> Self {
         Node {
+            id,
             raft_group: None,
             my_mailbox,
             mailboxes,
@@ -235,6 +261,7 @@ impl Node {
 }
 
 fn on_ready(
+    id: u64,
     raft_group: &mut RawNode<MemStorage>,
     kv_pairs: &mut HashMap<u16, String>,
     mailboxes: &HashMap<u64, Sender<Message>>,
@@ -248,6 +275,7 @@ fn on_ready(
 
     // Get the `Ready` with `RawNode::ready` interface.
     let mut ready = raft_group.ready();
+    info!(logger, "DLZ received Ready for Node{id:?}: {ready:?}");
 
     let handle_messages = |msgs: Vec<Message>| {
         for msg in msgs {
@@ -280,6 +308,9 @@ fn on_ready(
 
     let mut handle_committed_entries =
         |rn: &mut RawNode<MemStorage>, committed_entries: Vec<Entry>| {
+            if !committed_entries.is_empty() {
+                info!(logger, "DLZ handle_committed_entries for Node{id:?}: {committed_entries:?}");
+            }
             for entry in committed_entries {
                 if entry.data.is_empty() {
                     // From new elected leaders.
@@ -333,6 +364,7 @@ fn on_ready(
 
     // Call `RawNode::advance` interface to update position flags in the raft.
     let mut light_rd = raft_group.advance(ready);
+    info!(logger, "DLZ received LightReady for Node{id:?}: {light_rd:?}");
     // Update commit index.
     if let Some(commit) = light_rd.commit_index() {
         store.wl().mut_hard_state().set_commit(commit);
